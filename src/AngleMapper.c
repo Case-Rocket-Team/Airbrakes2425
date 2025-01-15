@@ -1,8 +1,5 @@
-float angleMapper()
+float angleMapper(float inputAlt, float inputVel)
 {
-    float inputAlt;
-    float inputVel;
-
     //make dummy matrix 6000-9200m 0-300m/s
     float mapMatrix[320][60];
     
