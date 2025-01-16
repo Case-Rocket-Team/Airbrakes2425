@@ -1,7 +1,7 @@
 float angleMapper(float inputAlt, float inputVel)
 {
     //range of inputs expected: 6000-9200m 0-300m/s, lookup table has increments of 10m and 5m/s
-    //make lookup tabke matrix
+    //make lookup table matrix
     float mapMatrix[320][60];
     
     //dummy matrix
