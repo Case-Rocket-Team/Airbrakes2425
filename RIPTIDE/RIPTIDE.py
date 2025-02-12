@@ -5,7 +5,7 @@ from scipy.integrate import solve_ivp
 from mpl_toolkits.mplot3d import Axes3D
 
 
-def gravity_acceleration(h = 0,
+def gravity_acceleration(h,
                           phi = 31.04980169999999, # m/s^2
                           GM = 3.986004418e14, # 
                           a = 6378137
@@ -20,7 +20,7 @@ rho_f = lambda h: Atmosphere(h).density[0]
 # create a function of time and state
 def state_function(
     t,state,
-    m = 25,
+    m = 17.78,
     CdA = 0.01
 ):
     x,z,vx,vz = state
@@ -52,7 +52,7 @@ out = solve_ivp(
     events=[mach_event,altitude_event]
 )
 
-CdAs = np.linspace(0.01,0.05,500)
+CdAs = np.linspace(0.00666,0.031968,500)
 curves = {}
 for CdA in CdAs:
     soln = solve_ivp(
@@ -65,24 +65,24 @@ for CdA in CdAs:
     curves[CdA] = soln
 
 
-cmap = lambda CdA: ((CdA - 0.01)/0.04,1.-(CdA - 0.01)/0.04,0)
+cmap = lambda CdA: ((CdA - 0.00666) / (0.031968 - 0.00666), 1.0 - (CdA - 0.00666) / (0.031968 - 0.00666), 0)
 for CdA,curve in curves.items():
-    plt.plot(curve['y'][1],curve['y'][3],color=cmap(CdA))
+    plt.plot(curve['y'][1]-893,curve['y'][3],color=cmap(CdA))
 plt.xlabel('Height (m)')
 plt.ylabel('Velocity (m/s)')
 plt.show()
 
 velocities = np.concatenate([soln['y'][3] for soln in curves.values()])
-heights = np.concatenate([soln['y'][1] for soln in curves.values()])
+heights = np.concatenate([soln['y'][1]-893 for soln in curves.values()])
 cdas = np.concatenate([np.full(soln['y'][1].shape,cda) for cda,soln in curves.items()])
 
-def cost(x):
-    best_guess = x[5] * velocities**2 + x[4] * heights**2 + x[3] * velocities * heights + x[2] * velocities +  x[1] * heights + x[0]
-    loss = cdas - best_guess
-    cost = np.dot(loss,loss)
-    return cost
+def cost(velHeights, a, b, c, d, e, f):
+    alts, vels = velHeights
+    best_guess = a + b*alts + c*vels + d*alts**2 + e*vels**2 +f*alts*vels
+    return best_guess
 
-from scipy.optimize import minimize
-optim = minimize(cost,[0.1,1e-3,1e-2,1e-1,1e-4,1e-6])
+from scipy.optimize import curve_fit
 
-optim
+popt, pcov = curve_fit(cost, (heights, velocities), cdas)
+print(popt)
+
