@@ -120,7 +120,7 @@ def ukf_update(x_pred, P_pred, z):
         z_diff = measurement_sigma[i]-z_pred #difference between measurement and predicted measurement
         x_diff = sigma_points[i] - x_pred #difference between current state and predicted state
         P_zz += W_c[i]*np.outer(z_diff, z_diff) #covariance of z and z (will need to replace np.outer with CMSIS equivalent eventually)
-        P_xz +=W_c[i]*np.outer(x_diff,x_diff) #covariance of x and x (will need to replace np.outer here too)
+        P_xz +=W_c[i]*np.outer(x_diff,z_diff) #covariance of x and x (will need to replace np.outer here too)
 
     #calculate Kalman gain
     K = np.zeros((STATE_DIM, MEAS_DIM))
