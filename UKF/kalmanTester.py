@@ -9,7 +9,7 @@ import matplotlib.pyplot as pplot
 def fakeKalmanFilter(time, xa, ya, za, temp, pressure, rollRate, pitchRate, yawRate):
     return
 
-def testFilter(inDataFile = "texasdata.csv"):
+def testFilter(inDataFile = "texasdatametric.csv"):
     inData = pd.read_csv(inDataFile)
 
     for i in range(1, len(inData)):
