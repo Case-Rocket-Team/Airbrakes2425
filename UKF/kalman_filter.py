@@ -1,152 +1,237 @@
 import cmsisdsp as dsp
 import numpy as np
 
-
 STATE_DIM = 16 #[x,y,z,v_x,v_y,v_z,a_x,a_y,a_z,q_w,q_x,q_y,q_z,w_x,w_y,w_z]
 MEAS_DIM = 7 #[z,abody_x,abody_y,abody_z,w_x,w_y,w_z]
+alpha = 1e-3
+beta = 2
+kappa = 1
 
-x=np.zeros(STATE_DIM) #state vector
-P = np.eye(STATE_DIM)*0.1 #covariance matrix with small initial uncertainty
+process_noise = 1e-7*np.eye(STATE_DIM)
+process_noise[0:3, 0:3] += 1e-5 * np.eye(3)
+# process_noise[3:6, 3:6] += 1e-4 * np.eye(3)
+process_noise[6:9, 6:9] += 1e-3 * np.eye(3)
 
-#alpha beta and kappa are ideal values, should be tweaked with testing
-alpha = 0.001 #determines spread of sigma points around mean
-beta = 2 #incorporates prior knowledge of x distribution
-kappa = 0 #secondary scaling parameter
-lambda_ = alpha**2*(STATE_DIM+kappa) - STATE_DIM #scaling parameter
+process_noise[9:13, 9:13] += 1e-7 * np.eye(4)
+process_noise[13:16, 13:16] += 1e-6 * np.eye(3)
 
-#Covariance and mean weights
-W_m = np.full(2 * STATE_DIM + 1, 1 / (2 * (STATE_DIM + lambda_)))
-W_c = np.copy(W_m)
-W_m[0] = lambda_/(STATE_DIM+lambda_)
-W_c[0] = lambda_/(STATE_DIM+lambda_) + (1-alpha**2+beta)
+starting_state = np.array([0,0,0,
+                   0,0,0,
+                   0,0,0,
+                   1,0,0,0,
+                   0,0,0])
 
+baro_measurement_noise = np.diag(np.array((0.06, 0.01)))
+accel_measurement_noise = np.diag(9.8065*529000e-6*np.ones(3,))
+gyro_measurement_noise = np.diag(0.00225 * np.pi / 180 * np.ones(3, ))
 
-#generate the sigma points 
-def generate_sigma_points(x, P):
-    n = STATE_DIM
-    sigma_points = np.zeros((2*n+1,n))
-    sqrtP = np.zeros_like(P)
-    dsp.arm_mat_cholesky_f32(P,sqrtP)
+baro_noise_lerp = 0
+accel_noise_lerp = 0
+gyro_noise_lerp = 0
 
-    sigma_points[0] = x
-    for i in range(n):
-        sigma_points[i+1] = x+sqrtP[i]
-        sigma_points[n+i+1] = x-sqrtP[i]
-    return sigma_points
+def sigma_gen(state, covariance):
+    num_states = np.size(state)
+    sigma_points = np.zeros((num_states, 2 * num_states + 1))
+    mean_weights = np.zeros(2 * num_states + 1)
+    cov_weights = np.zeros(2 * num_states + 1)
 
+    sigma_points[:,0] = state
+    mean_weights[0] = (alpha**2 * kappa - num_states) / (alpha**2 * kappa)
+    cov_weights[0] = mean_weights[0] - alpha**2 + beta
 
-#calculate dq from q and omega
-def quaternion_derivative(q, omega):
-    q_w, q_x, q_y, q_z=q
-    omega_x, omega_y, omega_z = omega
+    A = dsp.arm_mat_cholesky_f32(covariance)[1]
 
-    dq = 0.5*np.array([-q_x * omega_x - q_y * omega_y - q_z * omega_z,
-         q_w * omega_x + q_y * omega_z - q_z * omega_y,
-         q_w * omega_y - q_x * omega_z + q_z * omega_x,
-         q_w * omega_z + q_x * omega_y - q_y * omega_x])
-    return dq
+    remaining_weights = 1 / (2 * alpha**2 * kappa)
 
-#predictor model (dynamics equations)
-def predict_state(x, dt):
-    pos = x[:3]
-    vel = x[3:6]
-    q = x[6:10]
-    omega = x[10:13]
-    acc = x[13:16]
+    for i in range(num_states):
+      sigma_points[:,1 + i] = state + alpha * dsp.arm_sqrt_f32(kappa)[1] * A[:,i]
+      sigma_points[:,1 + num_states + i] = state - alpha * dsp.arm_sqrt_f32(kappa)[1] * A[:,i]
 
-    new_pos = pos + vel*dt+0.5*acc*(dt**2) #kinematic position eq
-    new_vel = vel + acc*dt #kinematic velocity eq
-    dq = quaternion_derivative(q, omega) #calculate dq
-    new_q = q+dq*dt #calculate new q with dq and dt
-    dsp.arm_quaternion_normalize_f32(new_q, new_q, len(new_q)) #normalize new quaternion vector
+      mean_weights[1 + i:: num_states] = remaining_weights
+      cov_weights[1 + i:: num_states] = remaining_weights
 
-    new_omega = omega
-    new_acc = acc
-
-    new_state = np.zeros_like(x)
-    new_state[:3] = new_pos
-    new_state[3:6] = new_vel
-    new_state[6:10] = new_q
-    new_state[10:13] = new_omega
-    new_state[13:16] = new_acc
-
-    return new_state #predicted state vector for next time step
-
-#transform prediction to measurement space
-def measurement_model(x):
-    q=x[6:10]
-    acc_world = x[13:16]
-    omega = x[10:13]
-
-    #transform acceleration from world frame (state vector) to body frame (IMU)
-    acc_body = np.zeros(3)
-    inverse_q = np.zeros_like(q)
-    dsp.arm_quaternion_inverse_f32(q,inverse_q,len(q))
-    dsp.arm_quaternion_product(acc_world, inverse_q, acc_body)
-
-    return np.concatenate((x[4], acc_body, omega))
+    return sigma_points, mean_weights, cov_weights
 
 
-#predictor
-def ukf_predict(x, P, dt):
+def point_prop(state, dt):
+   h_dt = dt**2/2
+   pos = state[0:3]
+   print("hi")
+   vel = state[3:6]
+   acc = state[6:9]
+   q = dsp.arm_mat_trans_f32(state[9:13,:])[1] 
+   q = dsp.arm_quaternion_normalize_f32(q)
 
-    #generate and propagate sigma points through prediction model
-    sigma_points = generate_sigma_points(x, P)
-    propagated_sigma_points = np.array([predict_state(sp,dt) for sp in sigma_points])
+   omega = state[13:16,:]
 
-    #predict new state vector and covariance
-    x_pred = np.sum(W_m[:,None] * propagated_sigma_points, axis=0)
-    P_pred = np.zeros(STATE_DIM, STATE_DIM)
-    for i in range (2*STATE_DIM+1):
-        diff = propagated_sigma_points[i] -x_pred
-        P_pred += W_c[i]*np.outer(diff,diff)
-    return x_pred, P_pred
+   pos_prime = pos+dt*vel+h_dt*acc
+   vel_prime = vel+dt*acc
+   acc_prime = acc
 
+   #BUG quaternion not working, length is 44, should be 33
+   rotated_q = dsp.arm_rotation2quaternion_f32(dt*dsp.arm_mat_trans_f32(omega)[1])
+   rotated_q = dsp.arm_quaternion_product_f32(rotated_q,q) #elementwise or quaternion product?
+   rotated_q = dsp.arm_quaternion_normalize_f32(rotated_q)
+   q_prime = dsp.arm_mat_trans_f32(rotated_q)[1]
 
-#corrector
-def ukf_update(x_pred, P_pred, z):
+   print(pos_prime)
+   omega_prime = omega
 
-    #generate new sigma points and propagate through measurement model
-    sigma_points = generate_sigma_points(x_pred, P_pred)
-    measurement_sigma = np.array([measurement_model(sp) for sp in sigma_points])
+   return np.concatenate((pos_prime,vel_prime,acc_prime,q_prime,omega_prime))
 
-    #predict measurement
-    z_pred = np.sum(W_m[:,None]*measurement_sigma, axis = 0)
+def update_process_noise(innovation, kalman_gain, process_noise, noise_lerp):
+   
+   vec = dsp.arm_mat_mult_f32(kalman_gain, innovation)[1]
+   vec_T = dsp.arm_mat_trans_f32(vec)[1]
 
-    P_zz = np.zeros((MEAS_DIM, MEAS_DIM))
-    P_xz = np.zeros((STATE_DIM, MEAS_DIM))
+   return (1-noise_lerp)*process_noise+noise_lerp*(dsp.arm_mat_mult_f32(vec_T, vec)[1])
 
-    for i in range (2*STATE_DIM+1):
-        z_diff = measurement_sigma[i]-z_pred #difference between measurement and predicted measurement
-        x_diff = sigma_points[i] - x_pred #difference between current state and predicted state
-        P_zz += W_c[i]*np.outer(z_diff, z_diff) #covariance of z and z (will need to replace np.outer with CMSIS equivalent eventually)
-        P_xz +=W_c[i]*np.outer(x_diff,z_diff) #covariance of x and x (will need to replace np.outer here too)
+def predict(state, covariance, dt):
+   sigma_points, mean_weights, cov_weights = sigma_gen(state, covariance)
 
-    #calculate Kalman gain
-    K = np.zeros((STATE_DIM, MEAS_DIM))
-    P_zz_inverse = np.zeros_like(P_zz)
-    dsp.arm_mat_inverse_f32(P_zz, P_zz_inverse)
-    dsp.arm_mat_mult_f32(P_xz, P_zz_inverse, K)
+   x_prime = point_prop(sigma_points, dt)
+   x_prime_T = dsp.arm_mat_trans_f32(x_prime)[1]
+   mean = dsp.arm_mat_mult_f32(x_prime_T, mean)[1]
+   covariance = 0
+   for i in range(2*np.size(state)+1):
+      dev = x_prime[i] - mean
+      covariance+=cov_weights[i]*(dsp.arm_mat_mult_f32(dev, dsp.arm_mat_trans_f32(dev)[1])[1])
+   return mean, covariance
 
-    #calculate corrected state vector
-    x_updated = x_pred + K*(z-z_pred)
+def baro_obs_pred(state):
+   height = state[2]
+   g = 9.80665  # Acceleration due to gravity (m/s^2)
+   M = 0.0289644  # Molar mass of Earth's air (kg/mol)
+   R = 8.31432  # Universal gas constant (J/(mol*K))
+   T0 = 288.15  # Standard temperature at sea level (K)
+   P0 = 101325  # Standard pressure at sea level (Pa)
 
-    #calculate corrected covariance
-    k_pzz = np.zeros((STATE_DIM, MEAS_DIM))
-    dsp.arm_mat_mult_f32(K, P_zz, k_pzz)
-    K_t = np.zeros((MEAS_DIM, STATE_DIM))
-    dsp.arm_mat_trans_f32(K, K_t)
-    k_pzz_kt = np.zeros((STATE_DIM, STATE_DIM))
-    dsp.arm_mat_mult_f32(k_pzz, K_t, k_pzz_kt)
-    P_updated = P_pred - k_pzz_kt
-
-    return x_updated, P_updated
-
-#takes in sensor measurements and formats them for the Kalman filter (main component is calculating baro alt)
-def get_measurement(acc, baro, gyro, P_0):
-    baro_temp = baro[0]
-    baro_pres = baro[1]
-    h = (((P_0/baro_pres)**(1/5.257)-1)*(baro_temp+273.15))/(0.0065) #hypsometric formula, probably incorrect but can fix later
-    return np.concatenate((h, acc, gyro)) #measurement vector
+   temperature = T0-0.0065*height
+   pressure = P0 *((1-(0.0065*height)/T0)**(g*M)/(R*0.0065))/1e3
 
 
+   return np.vstack((pressure, temperature))
+
+def update_baro_measurement_noise(residual, pred_measure_cov):
+   return (1-baro_noise_lerp)*baro_measurement_noise + baro_noise_lerp*(dsp.arm_mat_mult_f32(residual, dsp.arm_mat_trans_f32(residual)[1])[1] + pred_measure_cov)
+
+def baro_correct(state, covariance, measurement):
+   global baro_measurement_noise
+   global process_noise
+   sigma_points, mean_weights, cov_weights = sigma_gen(state, covariance)
+   pred_measurements = baro_obs_pred(sigma_points)
+
+   mean_measure = dsp.arm_mat_mult_f32(mean_weights, dsp.arm_mat_trans_f32(pred_measurements)[1])[1]
+   raw_cov_measure = 0
+   cross_cov = 0
+   for i in range(2*np.size(state)+1):
+      dev = pred_measurements[i]-mean_measure
+      raw_cov_measure +=cov_weights[i]*(dsp.arm_mat_mult(dev, dsp.arm_mat_trans_f32(dev)[1])[1])
+      sigma_dev = sigma_points[i] - mean_measure
+      cross_cov +=cov_weights[i]*(dsp.arm_mat_mult_f32(sigma_dev, dsp.arm_mat_trans_f32(dev)[1])[1])
+
+
+   cov_measure = raw_cov_measure+baro_measurement_noise
+   kalman_gain = dsp.arm_mat_mult_f32(cross_cov, dsp.arm_mat_inverse_f32(cov_measure)[1])[1]
+   posterior_x = state+dsp.arm_mat_mult_f32(kalman_gain, measurement-mean_measure)[1]
+   posterior_cov = covariance - dsp.arm_mat_mult_f32(kalman_gain, dsp.arm_mat_mult_f32(cov_measure, dsp.arm_mat_trans_f32(kalman_gain)[1])[1])[1]
+
+   innovation = measurement-mean_measure
+   residual = measurement-baro_obs_pred(dsp.arm_mat_trans_f32(posterior_x))[1]
+   baro_measurement_noise = update_baro_measurement_noise(residual, raw_cov_measure)
+   process_noise = update_process_noise(innovation, kalman_gain,process_noise,baro_noise_lerp)
+   posterior_cov = (posterior_cov + dsp.arm_mat_trans_f32(posterior_cov)[1])/2
+
+   return posterior_x, posterior_cov
+
+
+def accel_obs_pred(state):
+   g=9.8065
+
+   accel = state[6:9]+dsp.arm_mat_trans_f32(np.array([[0,0,g]]))[1] #TODO check if Sirin IMU includes gravity in measurement
+   q = dsp.arm_mat_trans_f32(state[9:13])[1]
+   q = dsp.arm_quaternion_normalize_f32(q)
+
+
+   #TODO check if these are correct, and if omega is needed
+   #omega = dsp.arm_quaternion_product_single(dsp.arm_quaternion_conjugate_f32(q),dsp.arm_quaternion_product_single(dsp.arm_mat_trans_f32(state[13:16]),q))[1:] 
+   body_acc = dsp.arm_quaternion_product_single(dsp.arm_quaternion_conjugate_f32(q),dsp.arm_quaternion_product_single(dsp.arm_mat_trans_f32(accel),q)[1])[1:]
+
+   #should we remove centripetal accel? will that provide a ton of error? how far from c_g is Sirin's IMU?
+
+   return body_acc
+
+def update_accel_measurement_noise(residual, pred_measure_cov):
+   return (1-accel_noise_lerp)*accel_measurement_noise + accel_noise_lerp*(dsp.arm_mat_mult_f32(residual, dsp.arm_mat_trans_f32(residual))[1] + pred_measure_cov)
+
+
+def accel_correct(state, covariance, measurement):
+   global accel_measurement_noise
+   global process_noise
+   sigma_points, mean_weights, cov_weights = sigma_gen(state, covariance)
+   pred_measurements = accel_obs_pred(sigma_points)
+
+   mean_measure = dsp.arm_mat_mult_f32(mean_weights, dsp.arm_mat_trans_f32(pred_measurements)[1])[1]
+   raw_cov_measure = 0
+   cross_cov = 0
+   for i in range(2*np.size(state)+1):
+      dev = pred_measurements[i]-mean_measure
+      raw_cov_measure +=cov_weights[i]*(dsp.arm_mat_mult(dev, dsp.arm_mat_trans_f32(dev)[1])[1])
+      sigma_dev = sigma_points[i] - mean_measure
+      cross_cov +=cov_weights[i]*(dsp.arm_mat_mult_f32(sigma_dev, dsp.arm_mat_trans_f32(dev)[1])[1])
+
+
+   cov_measure = raw_cov_measure+accel_measurement_noise
+   kalman_gain = dsp.arm_mat_mult_f32(cross_cov, dsp.arm_mat_inverse_f32(cov_measure)[1])[1]
+   posterior_x = state+dsp.arm_mat_mult_f32(kalman_gain, measurement-mean_measure)[1]
+   posterior_cov = covariance - dsp.arm_mat_mult_f32(kalman_gain, dsp.arm_mat_mult_f32(cov_measure, dsp.arm_mat_trans_f32(kalman_gain)[1])[1])[1]
+
+   innovation = measurement-mean_measure
+   residual = measurement-accel_obs_pred(dsp.arm_mat_trans_f32(posterior_x)[1])
+   accel_measurement_noise = update_accel_measurement_noise(residual, raw_cov_measure)
+   process_noise = update_process_noise(innovation, kalman_gain, process_noise, accel_noise_lerp)
+   posterior_cov = (posterior_cov + dsp.arm_mat_trans_f32(posterior_cov)[1])/2
+
+   return posterior_x, posterior_cov
+
+def gyro_obs_pred(state):
+   q = dsp.arm_mat_trans_f32(state[9:13])[1]
+   q = dsp.arm_quaternion_normalize_f32(q)
+   body_omega = dsp.arm_quaternion_product_single(dsp.arm_quaternion_conjugate_f32(q),dsp.arm_quaternion_product_single(dsp.arm_mat_trans_f32(state[13:16])[1],q))[1:]
+   return body_omega
+
+def update_gyro_measurement_noise(residual, pred_measure_cov):
+   return (1-gyro_noise_lerp)*gyro_measurement_noise + gyro_noise_lerp*(dsp.arm_mat_mult_f32(residual, dsp.arm_mat_trans_f32(residual)[1])[1] + pred_measure_cov)
+
+
+def gyro_correct(state, covariance, measurement):
+   global gyro_measurement_noise
+   global process_noise
+   sigma_points, mean_weights, cov_weights = sigma_gen(state, covariance)
+   pred_measurements = gyro_obs_pred(sigma_points)
+
+   mean_measure = dsp.arm_mat_mult_f32(mean_weights, dsp.arm_mat_trans_f32(pred_measurements)[1])[1]
+   raw_cov_measure = 0
+   cross_cov = 0
+   for i in range(2*np.size(state)+1):
+      dev = pred_measurements[i]-mean_measure
+      raw_cov_measure +=cov_weights[i]*(dsp.arm_mat_mult(dev, dsp.arm_mat_trans_f32(dev)[1])[1])
+      sigma_dev = sigma_points[i] - mean_measure
+      cross_cov +=cov_weights[i]*(dsp.arm_mat_mult_f32(sigma_dev, dsp.arm_mat_trans_f32(dev)[1])[1])
+
+
+   cov_measure = raw_cov_measure+gyro_measurement_noise
+   kalman_gain = dsp.arm_mat_mult_f32(cross_cov, dsp.arm_mat_inverse_f32(cov_measure)[1])[1]
+   posterior_x = state+dsp.arm_mat_mult_f32(kalman_gain, measurement-mean_measure)[1]
+   posterior_cov = covariance - dsp.arm_mat_mult_f32(kalman_gain, dsp.arm_mat_mult_f32(cov_measure, dsp.arm_mat_trans_f32(kalman_gain)[1])[1])[1]
+
+   innovation = measurement-mean_measure
+   residual = measurement-gyro_obs_pred(dsp.arm_mat_trans_f32(posterior_x)[1])
+   gyro_measurement_noise = update_gyro_measurement_noise(residual, raw_cov_measure)
+   process_noise = update_process_noise(innovation, kalman_gain, process_noise, gyro_noise_lerp)
+   posterior_cov = (posterior_cov + dsp.arm_mat_trans_f32(posterior_cov)[1])/2
+
+   return posterior_x, posterior_cov
+
+
+   
