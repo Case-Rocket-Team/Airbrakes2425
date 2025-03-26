@@ -1,6 +1,6 @@
 import cmsisdsp as dsp
 import numpy as np
-
+import matplotlib.pyplot as plt
 STATE_DIM = 16 #[x,y,z,v_x,v_y,v_z,a_x,a_y,a_z,q_w,q_x,q_y,q_z,w_x,w_y,w_z]
 MEAS_DIM = 7 #[z,abody_x,abody_y,abody_z,w_x,w_y,w_z]
 alpha = 1e-3
@@ -56,27 +56,31 @@ def sigma_gen(state, covariance):
 def point_prop(state, dt):
    h_dt = dt**2/2
    pos = state[0:3]
-   print("hi")
+
    vel = state[3:6]
    acc = state[6:9]
-   q = dsp.arm_mat_trans_f32(state[9:13,:])[1] 
-   q = dsp.arm_quaternion_normalize_f32(q)
+   q = dsp.arm_mat_trans_f32(state[9:13])[1] 
+   #q = dsp.arm_quaternion_normalize_f32(q)
 
-   omega = state[13:16,:]
+   omega = state[13:16]
 
    pos_prime = pos+dt*vel+h_dt*acc
    vel_prime = vel+dt*acc
    acc_prime = acc
 
-   #BUG quaternion not working, length is 44, should be 33
-   rotated_q = dsp.arm_rotation2quaternion_f32(dt*dsp.arm_mat_trans_f32(omega)[1])
-   rotated_q = dsp.arm_quaternion_product_f32(rotated_q,q) #elementwise or quaternion product?
-   rotated_q = dsp.arm_quaternion_normalize_f32(rotated_q)
-   q_prime = dsp.arm_mat_trans_f32(rotated_q)[1]
+   #BUG CMSIS transpose is not working, doing numpy for now
+   q_prime = np.zeros_like(q)
+   for i, omega_row in enumerate(omega):
+      theta = (np.sqrt(omega_row[0]**2 + omega_row[1]**2+omega_row[2]**2))*dt
+      R = np.eye(3) + np.array([[0, -1*omega_row[2], omega_row[1]], [omega_row[2], 0, -1*omega_row[0]], [-1*omega_row[1], omega_row[0], 0]])+ (1- np.cos(theta))*np.array([[omega_row[0]**2, omega_row[0]*omega_row[1], omega_row[0]*omega_row[2]], [omega_row[1]*omega_row[0], omega_row[1]**2, omega_row[1]*omega_row[2]], [omega_row[2]*omega_row[0], omega_row[2]*omega_row[1], omega_row[2]**2]])
+      rotated_q = dsp.arm_quaternion_product_single_f32(dsp.arm_rotation2quaternion_f32(R),q[i])
+      rotated_q = dsp.arm_quaternion_normalize_f32(rotated_q)
+      q_prime[i] = rotated_q
 
-   print(pos_prime)
+   q_prime = q_prime.T
+
+
    omega_prime = omega
-
    return np.concatenate((pos_prime,vel_prime,acc_prime,q_prime,omega_prime))
 
 def update_process_noise(innovation, kalman_gain, process_noise, noise_lerp):
@@ -88,14 +92,19 @@ def update_process_noise(innovation, kalman_gain, process_noise, noise_lerp):
 
 def predict(state, covariance, dt):
    sigma_points, mean_weights, cov_weights = sigma_gen(state, covariance)
+   x_prime = point_prop(sigma_points,dt)
+   #mean = dsp.arm_mat_mult_f32(mean_weights, x_prime.T)[1]
+   print(f"X_prime: {np.size(x_prime.T)}")
+   print(f"Mean weights: {np.size(mean_weights)}")
+   mean = mean_weights@x_prime.T
+   dev = x_prime - mean[:, np.newaxis]
+   new_cov = np.zeros((dev.shape[0], dev.shape[0]))
+   for i in range(dev.shape[1]):
+      d = dev[:,i]
+      new_cov+=cov_weights[i]*np.outer(d,d)
+   
+   covariance+=process_noise
 
-   x_prime = point_prop(sigma_points, dt)
-   x_prime_T = dsp.arm_mat_trans_f32(x_prime)[1]
-   mean = dsp.arm_mat_mult_f32(x_prime_T, mean)[1]
-   covariance = 0
-   for i in range(2*np.size(state)+1):
-      dev = x_prime[i] - mean
-      covariance+=cov_weights[i]*(dsp.arm_mat_mult_f32(dev, dsp.arm_mat_trans_f32(dev)[1])[1])
    return mean, covariance
 
 def baro_obs_pred(state):
