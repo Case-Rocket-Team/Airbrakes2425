@@ -1,6 +1,11 @@
 import cmsisdsp as dsp
 import numpy as np
 import matplotlib.pyplot as plt
+
+
+#DSP transpose not working all the time, using numpy transpose in some locations.
+
+
 STATE_DIM = 16 #[x,y,z,v_x,v_y,v_z,a_x,a_y,a_z,q_w,q_x,q_y,q_z,w_x,w_y,w_z]
 MEAS_DIM = 7 #[z,abody_x,abody_y,abody_z,w_x,w_y,w_z]
 alpha = 1e-3
@@ -60,7 +65,8 @@ def point_prop(state, dt):
    vel = state[3:6]
    acc = state[6:9]
    q = dsp.arm_mat_trans_f32(state[9:13])[1] 
-   #q = dsp.arm_quaternion_normalize_f32(q)
+   #TODO if it turns out to be needed, this normalization has to be done in a for loop
+   #q = dsp.arm_quaternion_normalize_f32(q) 
 
    omega = state[13:16]
 
@@ -94,9 +100,7 @@ def predict(state, covariance, dt):
    sigma_points, mean_weights, cov_weights = sigma_gen(state, covariance)
    x_prime = point_prop(sigma_points,dt)
    #mean = dsp.arm_mat_mult_f32(mean_weights, x_prime.T)[1]
-   print(f"X_prime: {np.size(x_prime.T)}")
-   print(f"Mean weights: {np.size(mean_weights)}")
-   mean = mean_weights@x_prime.T
+   mean = mean_weights@x_prime.T #eventually replace @ operator and .T with CMSIS once we figure out how to get it working
    dev = x_prime - mean[:, np.newaxis]
    new_cov = np.zeros((dev.shape[0], dev.shape[0]))
    for i in range(dev.shape[1]):
@@ -114,10 +118,9 @@ def baro_obs_pred(state):
    R = 8.31432  # Universal gas constant (J/(mol*K))
    T0 = 288.15  # Standard temperature at sea level (K)
    P0 = 101325  # Standard pressure at sea level (Pa)
-
+   print(0.0065*height)
    temperature = T0-0.0065*height
-   pressure = P0 *((1-(0.0065*height)/T0)**(g*M)/(R*0.0065))/1e3
-
+   pressure = P0 * np.power((1 - (0.0065 * height) / T0), (g * M) / (R * 0.0065))
 
    return np.vstack((pressure, temperature))
 
@@ -129,27 +132,39 @@ def baro_correct(state, covariance, measurement):
    global process_noise
    sigma_points, mean_weights, cov_weights = sigma_gen(state, covariance)
    pred_measurements = baro_obs_pred(sigma_points)
-
-   mean_measure = dsp.arm_mat_mult_f32(mean_weights, dsp.arm_mat_trans_f32(pred_measurements)[1])[1]
+   print(pred_measurements)
+   #mean_measure = dsp.arm_mat_mult_f32(mean_weights, dsp.arm_mat_trans_f32(pred_measurements)[1])[1]
+   mean_measure = mean_weights@pred_measurements.T
+   print(measurement)
    raw_cov_measure = 0
    cross_cov = 0
-   for i in range(2*np.size(state)+1):
-      dev = pred_measurements[i]-mean_measure
-      raw_cov_measure +=cov_weights[i]*(dsp.arm_mat_mult(dev, dsp.arm_mat_trans_f32(dev)[1])[1])
-      sigma_dev = sigma_points[i] - mean_measure
-      cross_cov +=cov_weights[i]*(dsp.arm_mat_mult_f32(sigma_dev, dsp.arm_mat_trans_f32(dev)[1])[1])
+
+   dev = pred_measurements - mean_measure[:, np.newaxis]
+   raw_cov_measure = np.zeros((dev.shape[0], dev.shape[0]))
+   for i in range(dev.shape[1]):
+      d = dev[:,i]
+      raw_cov_measure+=cov_weights[i]*np.outer(d, d) #eventually write CMSIS based outer product function, not doing now to test for functionality first
+
+   cov_measure = raw_cov_measure + baro_measurement_noise
+
+   sigma_dev = sigma_points - state[:, np.newaxis]
+   
+   cross_cov = np.zeros((sigma_dev.shape[0], dev.shape[0]))
+   for i in range(sigma_dev.shape[1]):
+      d=dev[:,i]
+      sig_d = sigma_dev[:,i]
+      cross_cov +=cov_weights[i]*np.outer(sig_d, d)
 
 
-   cov_measure = raw_cov_measure+baro_measurement_noise
    kalman_gain = dsp.arm_mat_mult_f32(cross_cov, dsp.arm_mat_inverse_f32(cov_measure)[1])[1]
    posterior_x = state+dsp.arm_mat_mult_f32(kalman_gain, measurement-mean_measure)[1]
    posterior_cov = covariance - dsp.arm_mat_mult_f32(kalman_gain, dsp.arm_mat_mult_f32(cov_measure, dsp.arm_mat_trans_f32(kalman_gain)[1])[1])[1]
 
    innovation = measurement-mean_measure
-   residual = measurement-baro_obs_pred(dsp.arm_mat_trans_f32(posterior_x))[1]
+   residual = measurement-baro_obs_pred(posterior_x[:, np.newaxis])
    baro_measurement_noise = update_baro_measurement_noise(residual, raw_cov_measure)
    process_noise = update_process_noise(innovation, kalman_gain,process_noise,baro_noise_lerp)
-   posterior_cov = (posterior_cov + dsp.arm_mat_trans_f32(posterior_cov)[1])/2
+   posterior_cov = (posterior_cov + posterior_cov.T)/2
 
    return posterior_x, posterior_cov
 
@@ -241,6 +256,3 @@ def gyro_correct(state, covariance, measurement):
    posterior_cov = (posterior_cov + dsp.arm_mat_trans_f32(posterior_cov)[1])/2
 
    return posterior_x, posterior_cov
-
-
-   
