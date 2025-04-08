@@ -1,274 +1,160 @@
-import cmsisdsp as dsp
 import numpy as np
-import matplotlib.pyplot as plt
-
-
-#DSP transpose not working all the time, using numpy transpose in some locations.
-
-
-STATE_DIM = 16 #[x,y,z,v_x,v_y,v_z,a_x,a_y,a_z,q_w,q_x,q_y,q_z,w_x,w_y,w_z]
-MEAS_DIM = 7 #[z,abody_x,abody_y,abody_z,w_x,w_y,w_z]
+from scipy import linalg as sp
+import pyquaternion as quaternion
 alpha = 1e-3
 beta = 2
 kappa = 1
 
-process_noise = 1e-7*np.eye(STATE_DIM)
-process_noise[0:3, 0:3] += 1e-5 * np.eye(3)
-# process_noise[3:6, 3:6] += 1e-4 * np.eye(3)
-process_noise[6:9, 6:9] += 1e-3 * np.eye(3)
+n = 16
 
-process_noise[9:13, 9:13] += 1e-7 * np.eye(4)
-process_noise[13:16, 13:16] += 1e-6 * np.eye(3)
+lambda_ = alpha**2 * (n + kappa) - n
 
-starting_state = np.array([0,0,0,
-                   0,0,0,
-                   0,0,0,
-                   1,0,0,0,
-                   0,0,0])
 
-baro_measurement_noise = np.diag(np.array((0.06, 0.01)))
-accel_measurement_noise = np.diag(9.8065*529000e-6*np.ones(3,))
-gyro_measurement_noise = np.diag(0.00225 * np.pi / 180 * np.ones(3, ))
 
-baro_noise_lerp = 0
-accel_noise_lerp = 0
-gyro_noise_lerp = 0
 
-def sigma_gen(state, covariance):
-    num_states = np.size(state)
-    sigma_points = np.zeros((num_states, 2 * num_states + 1))
-    mean_weights = np.zeros(2 * num_states + 1)
-    cov_weights = np.zeros(2 * num_states + 1)
+def sigma_points_fn(X, P):
+    sigmas = np.zeros((2*n+1, n))
+    U = sp.cholesky((n+lambda_)*P)
 
-    sigma_points[:,0] = state
-    mean_weights[0] = (alpha**2 * kappa - num_states) / (alpha**2 * kappa)
-    cov_weights[0] = mean_weights[0] - alpha**2 + beta
+    sigmas[0] = X
+    for k in range (n):
+        sigmas[k+1] = X + U[k]
+        sigmas[n+k+1] = X - U[k]
+    return sigmas
 
-    A = dsp.arm_mat_cholesky_f32(covariance)[1]
-
-    remaining_weights = 1 / (2 * alpha**2 * kappa)
-
-    for i in range(num_states):
-      sigma_points[:,1 + i] = state + alpha * dsp.arm_sqrt_f32(kappa)[1] * A[:,i]
-      sigma_points[:,1 + num_states + i] = state - alpha * dsp.arm_sqrt_f32(kappa)[1] * A[:,i]
-
-      mean_weights[1 + i:: num_states] = remaining_weights
-      cov_weights[1 + i:: num_states] = remaining_weights
-
-    return sigma_points, mean_weights, cov_weights
-
+def unscented_transform(sigmas, Wm, Wc, Q):
+    x = np.dot(Wm, sigmas)
+    kmax, n = sigmas.shape
+    P = np.zeros((n,n))
+    for k in range(kmax):
+        y = sigmas[k]-x
+        P+=Wc[k]*np.outer(y,y)
+    P+=Q
+    return x, P
 
 def point_prop(state, dt):
-   h_dt = dt**2/2
-   pos = state[0:3]
+    if(dt==0):
+        dt = 0.001
 
-   vel = state[3:6]
-   acc = state[6:9]
-   q = dsp.arm_mat_trans_f32(state[9:13])[1] 
-   #TODO if it turns out to be needed, this normalization has to be done in a for loop
-   #q = dsp.arm_quaternion_normalize_f32(q) 
+    h_dt = dt**2 / 2
 
-   omega = state[13:16]
+    pos = state[0:3]
+    vel = state[3:6]
+    accel = state[6:9]
 
-   pos_prime = pos+dt*vel+h_dt*acc
-   vel_prime = vel+dt*acc
-   acc_prime = acc
+    q = quaternion.Quaternion(state[9:13])
+    q = q.normalised
+    
+    omega = state[13:16]
 
-   #BUG CMSIS transpose is not working, doing numpy for now
-   q_prime = np.zeros_like(q)
-   for i, omega_row in enumerate(omega):
-      theta = (np.sqrt(omega_row[0]**2 + omega_row[1]**2+omega_row[2]**2))*dt
-      R = np.eye(3) + np.array([[0, -1*omega_row[2], omega_row[1]], [omega_row[2], 0, -1*omega_row[0]], [-1*omega_row[1], omega_row[0], 0]])+ (1- np.cos(theta))*np.array([[omega_row[0]**2, omega_row[0]*omega_row[1], omega_row[0]*omega_row[2]], [omega_row[1]*omega_row[0], omega_row[1]**2, omega_row[1]*omega_row[2]], [omega_row[2]*omega_row[0], omega_row[2]*omega_row[1], omega_row[2]**2]])
-      rotated_q = dsp.arm_quaternion_product_single_f32(dsp.arm_rotation2quaternion_f32(R),q[i])
-      rotated_q = dsp.arm_quaternion_normalize_f32(rotated_q)
-      q_prime[i] = rotated_q
+    
+    pos_prime = pos + dt * vel + h_dt * accel
+    vel_prime = vel + dt * accel
+    accel_prime = accel
 
-   q_prime = q_prime.T
+    rotated_q = quaternion.Quaternion(axis=dt*omega)*q
+    rotated_q = rotated_q.normalised
 
+    q_prime = rotated_q.elements
+    
+    omega_prime = omega
+    
+    return np.concatenate((pos_prime, vel_prime, accel_prime, q_prime, omega_prime))
 
-   omega_prime = omega
-   return np.concatenate((pos_prime,vel_prime,acc_prime,q_prime,omega_prime))
+def predict(X, P, Wm, Wc, Q, dt):
+    sigmas = sigma_points_fn(X, P)
+    num_sigmas = sigmas.shape[0]
+    sigmas_f = np.zeros_like(sigmas)
+    for i in range(num_sigmas):
+        sigmas_f[i] = point_prop(sigmas[i], dt)
+    
+    xp, Pp = unscented_transform(sigmas_f, Wm, Wc, Q)
 
-def update_process_noise(innovation, kalman_gain, process_noise, noise_lerp):
-   vec = kalman_gain@innovation
-   #vec = dsp.arm_mat_mult_f32(kalman_gain, innovation)[1]
-   #vec_T = dsp.arm_mat_trans_f32(vec)[1]
-   #vec_T = vec.T
-   
-   
-   return (1-noise_lerp)*process_noise+noise_lerp*np.outer(vec,vec)
-
-def predict(state, covariance, dt):
-   sigma_points, mean_weights, cov_weights = sigma_gen(state, covariance)
-   x_prime = point_prop(sigma_points,dt)
-   #mean = dsp.arm_mat_mult_f32(mean_weights, x_prime.T)[1]
-   mean = mean_weights@x_prime.T #eventually replace @ operator and .T with CMSIS once we figure out how to get it working
-   dev = x_prime - mean[:, np.newaxis]
-   new_cov = np.zeros((dev.shape[0], dev.shape[0]))
-   for i in range(dev.shape[1]):
-      d = dev[:,i]
-      new_cov+=cov_weights[i]*np.outer(d,d)
-   
-   covariance+=process_noise
-
-   return mean, covariance
+    return xp, Pp, sigmas_f
 
 def baro_obs_pred(state):
-   height = state[2]
-   g = 9.80665  # Acceleration due to gravity (m/s^2)
-   M = 0.0289644  # Molar mass of Earth's air (kg/mol)
-   R = 8.31432  # Universal gas constant (J/(mol*K))
-   T0 = 288.15  # Standard temperature at sea level (K)
-   P0 = 101325  # Standard pressure at sea level (Pa)
-   print(0.0065*height)
-   temperature = T0-0.0065*height
-   pressure = P0 * np.power((1 - (0.0065 * height) / T0), (g * M) / (R * 0.0065))
+    height = state[2]
+    g = 9.80665  # Acceleration due to gravity (m/s^2)
+    M = 0.0289644  # Molar mass of Earth's air (kg/mol)
+    R = 8.31432  # Universal gas constant (J/(mol*K))
+    T0 = 308.964  # Standard temperature at sea level (K)
+    P0 = 101325  # Standard pressure at sea level (Pa)
+    temperature = T0-0.0065*height
+    base = 1 - (0.0065 * height) / T0
+    if base <= 0 or not np.isfinite(base):
+        print(f"[WARN] Invalid base in pressure calc: height={height}, T0={T0}, base={base}")
+    pressure = P0 * np.power(base, (g * M) / (R * 0.0065))
+    return np.array((pressure, temperature))
 
-   return np.vstack((pressure, temperature))
-
-def update_baro_measurement_noise(residual, pred_measure_cov):
-   return (1-baro_noise_lerp)*baro_measurement_noise + baro_noise_lerp*(dsp.arm_mat_mult_f32(residual, dsp.arm_mat_trans_f32(residual)[1])[1] + pred_measure_cov)
-
-def baro_correct(state, covariance, measurement):
-   global baro_measurement_noise
-   global process_noise
-   sigma_points, mean_weights, cov_weights = sigma_gen(state, covariance)
-   pred_measurements = baro_obs_pred(sigma_points)
-   print(pred_measurements)
-   #mean_measure = dsp.arm_mat_mult_f32(mean_weights, dsp.arm_mat_trans_f32(pred_measurements)[1])[1]
-   mean_measure = mean_weights@(pred_measurements.T)
-   print(measurement)
-   raw_cov_measure = 0
-   cross_cov = 0
-
-   dev = pred_measurements - mean_measure[:, np.newaxis]
-   raw_cov_measure = np.zeros((dev.shape[0], dev.shape[0]))
-   for i in range(dev.shape[1]):
-      d = dev[:,i]
-      raw_cov_measure+=cov_weights[i]*np.outer(d, d) #eventually write CMSIS based outer product function, not doing now to test for functionality first
-
-   cov_measure = raw_cov_measure + baro_measurement_noise
-
-   sigma_dev = sigma_points - state[:, np.newaxis]
-   
-   cross_cov = np.zeros((sigma_dev.shape[0], dev.shape[0]))
-   for i in range(sigma_dev.shape[1]):
-      d=dev[:,i]
-      sig_d = sigma_dev[:,i]
-      cross_cov +=cov_weights[i]*np.outer(sig_d, d)
-
-
-   kalman_gain = dsp.arm_mat_mult_f32(cross_cov, dsp.arm_mat_inverse_f32(cov_measure)[1])[1]
-   posterior_x = state+ (kalman_gain@(measurement-mean_measure))
-   #posterior_x = state+dsp.arm_mat_mult_f32(kalman_gain, measurement-mean_measure)[1]
-   posterior_cov = covariance - dsp.arm_mat_mult_f32(kalman_gain, dsp.arm_mat_mult_f32(cov_measure, dsp.arm_mat_trans_f32(kalman_gain)[1])[1])[1]
-
-   innovation = measurement-mean_measure
-   residual = measurement-baro_obs_pred(posterior_x[:, np.newaxis])
-   baro_measurement_noise = update_baro_measurement_noise(residual, raw_cov_measure)
-   process_noise = update_process_noise(innovation, kalman_gain,process_noise,baro_noise_lerp)
-   posterior_cov = (posterior_cov + posterior_cov.T)/2
-
-   return posterior_x, posterior_cov
-
+def baro_update(x, P, z, sigmas_f, Wm, Wc, R):
+    sigmas_h = np.zeros((2*n+1, 2))
+    num_sigmas = sigmas_h.shape[0]
+    for i in range(num_sigmas):
+        sigmas_h[i] = baro_obs_pred(sigmas_f[i])
+    zp, Pz = unscented_transform(sigmas_h, Wm, Wc, R)
+    #print(np.size(zp))
+    #print(unscented_transform(sigmas_h, Wm, Wc, R))
+    Pxz = np.zeros((np.size(x), np.size(z)))
+    for i in range(num_sigmas):
+        Pxz +=Wc[i]*np.outer(sigmas_f[i]-x, sigmas_h[i]-zp)
+    
+    K = np.dot(Pxz, np.linalg.inv(Pz))
+    
+    x_prime = x+np.dot(K, z-zp)
+    P_prime = P+np.dot(np.dot(K,Pz), K.T)
+    return x_prime, P_prime
 
 def accel_obs_pred(state):
-   g=9.8065
-   temp_accs = []
-   for i in range(np.size(state[0])):
-      state_prime = state[:,i]
-      accel = state_prime[6:9]+dsp.arm_mat_trans_f32(np.array([[0,0,g]]))[1]
-      q = dsp.arm_mat_trans_f32(state_prime[9:13])[1]
-      q = dsp.arm_quaternion_normalize_f32(q)
-      accel_t = dsp.arm_mat_trans_f32(accel)[1]
-      accel_t_q = dsp.arm_quaternion_product_single_f32(accel_t, q)
-      q_conj = dsp.arm_quaternion_conjugate_f32(q)
-      body_acc = dsp.arm_quaternion_product_single_f32(q_conj, accel_t_q)
-      temp_accs.append(body_acc)
-   body_accs = np.vstack(tuple(temp_accs))
-      
-   body_accs = body_accs.T
+    accel = state[6:9]
+    q = quaternion.Quaternion(state[9:13])
+    q = q.normalised
 
-   return body_accs[0:3]
+    body_accel_q = q.conjugate*quaternion.Quaternion(axis=accel)*q
+    body_accel = body_accel_q.vector
 
-def update_accel_measurement_noise(residual, pred_measure_cov):
-   return (1-accel_noise_lerp)*accel_measurement_noise + accel_noise_lerp*(dsp.arm_mat_mult_f32(residual, dsp.arm_mat_trans_f32(residual))[1] + pred_measure_cov)
+    return body_accel
 
-
-def accel_correct(state, covariance, measurement):
-   global accel_measurement_noise
-   global process_noise
-   sigma_points, mean_weights, cov_weights = sigma_gen(state, covariance)
-   pred_measurements = accel_obs_pred(sigma_points)
-
-   #mean_measure = dsp.arm_mat_mult_f32(mean_weights, dsp.arm_mat_trans_f32(pred_measurements)[1])[1]
-   mean_measure = mean_weights@(pred_measurements.T)
-   raw_cov_measure = 0
-   cross_cov = 0
-   dev = pred_measurements - mean_measure[:, np.newaxis]
-   raw_cov_measure = np.zeros((dev.shape[0], dev.shape[0]))
-   for i in range(dev.shape[1]):
-      d = dev[:,i]
-      raw_cov_measure+=cov_weights[i]*np.outer(d, d) #eventually write CMSIS based outer product function, not doing now to test for functionality first
-
-   cov_measure = raw_cov_measure + accel_measurement_noise
-
-   sigma_dev = sigma_points - state[:, np.newaxis]
-   
-   cross_cov = np.zeros((sigma_dev.shape[0], dev.shape[0]))
-   for i in range(sigma_dev.shape[1]):
-      d=dev[:,i]
-      sig_d = sigma_dev[:,i]
-      cross_cov +=cov_weights[i]*np.outer(sig_d, d)
-
-   cov_measure = raw_cov_measure+accel_measurement_noise
-   kalman_gain = dsp.arm_mat_mult_f32(cross_cov, dsp.arm_mat_inverse_f32(cov_measure)[1])[1]
-   posterior_x = state+ (kalman_gain@(measurement.T-mean_measure)[0])
-
-   posterior_cov = covariance - dsp.arm_mat_mult_f32(kalman_gain, dsp.arm_mat_mult_f32(cov_measure, dsp.arm_mat_trans_f32(kalman_gain)[1])[1])[1]
-
-   innovation = measurement-mean_measure
-   residual = measurement-baro_obs_pred(posterior_x[:, np.newaxis])
-   accel_measurement_noise = update_accel_measurement_noise(residual, raw_cov_measure)
-   process_noise = update_process_noise(innovation, kalman_gain,process_noise,baro_noise_lerp)
-   posterior_cov = (posterior_cov + posterior_cov.T)/2
-   return posterior_x, posterior_cov
+def accel_update(x, P, z, sigmas_f, Wm, Wc, R):
+    sigmas_h = np.zeros((2*n+1, 3))
+    num_sigmas = sigmas_h.shape[0]
+    for i in range(num_sigmas):
+        sigmas_h[i] = accel_obs_pred(sigmas_f[i])
+    zp, Pz = unscented_transform(sigmas_h, Wm, Wc, R)
+    Pxz = np.zeros((np.size(x), np.size(z)))
+    for i in range(num_sigmas):
+        Pxz +=Wc[i]*np.outer(sigmas_f[i]-x, sigmas_h[i]-zp)
+    
+    K = np.dot(Pxz, np.linalg.inv(Pz))
+    
+    x_prime = x+np.dot(K, z-zp)
+    P_prime = P+np.dot(np.dot(K,Pz), K.T)
+    return x_prime, P_prime
 
 def gyro_obs_pred(state):
-   q = dsp.arm_mat_trans_f32(state[9:13])[1]
-   q = dsp.arm_quaternion_normalize_f32(q)
-   body_omega = dsp.arm_quaternion_product_single(dsp.arm_quaternion_conjugate_f32(q),dsp.arm_quaternion_product_single(dsp.arm_mat_trans_f32(state[13:16])[1],q))[1:]
-   return body_omega
+    q = quaternion.Quaternion(state[9:13])
+    q = q.normalised
+    omega = state[13:16]
 
-def update_gyro_measurement_noise(residual, pred_measure_cov):
-   return (1-gyro_noise_lerp)*gyro_measurement_noise + gyro_noise_lerp*(dsp.arm_mat_mult_f32(residual, dsp.arm_mat_trans_f32(residual)[1])[1] + pred_measure_cov)
+    body_omega_q = q.conjugate*quaternion.Quaternion(axis=omega)*q
 
+    body_omega = body_omega_q.vector
+    return omega
 
-def gyro_correct(state, covariance, measurement):
-   global gyro_measurement_noise
-   global process_noise
-   sigma_points, mean_weights, cov_weights = sigma_gen(state, covariance)
-   pred_measurements = gyro_obs_pred(sigma_points)
+def gyro_update(x, P, z, sigmas_f, Wm, Wc, R):
+    
+    sigmas_h = np.zeros((2*n+1, 3))
+    num_sigmas = sigmas_h.shape[0]
+    for i in range(num_sigmas):
+        sigmas_h[i] = gyro_obs_pred(sigmas_f[i])
+    zp, Pz = unscented_transform(sigmas_h, Wm, Wc, R)
+    
+    Pxz = np.zeros((np.size(x), np.size(z)))
+    for i in range(num_sigmas):
+        Pxz +=Wc[i]*np.outer(sigmas_f[i]-x, sigmas_h[i]-zp)
+    
+    K = np.dot(Pxz, np.linalg.inv(Pz))
+    
 
-   mean_measure = dsp.arm_mat_mult_f32(mean_weights, dsp.arm_mat_trans_f32(pred_measurements)[1])[1]
-   raw_cov_measure = 0
-   cross_cov = 0
-   for i in range(2*np.size(state)+1):
-      dev = pred_measurements[i]-mean_measure
-      raw_cov_measure +=cov_weights[i]*(dsp.arm_mat_mult(dev, dsp.arm_mat_trans_f32(dev)[1])[1])
-      sigma_dev = sigma_points[i] - mean_measure
-      cross_cov +=cov_weights[i]*(dsp.arm_mat_mult_f32(sigma_dev, dsp.arm_mat_trans_f32(dev)[1])[1])
-
-
-   cov_measure = raw_cov_measure+gyro_measurement_noise
-   kalman_gain = dsp.arm_mat_mult_f32(cross_cov, dsp.arm_mat_inverse_f32(cov_measure)[1])[1]
-   posterior_x = state+dsp.arm_mat_mult_f32(kalman_gain, measurement-mean_measure)[1]
-   posterior_cov = covariance - dsp.arm_mat_mult_f32(kalman_gain, dsp.arm_mat_mult_f32(cov_measure, dsp.arm_mat_trans_f32(kalman_gain)[1])[1])[1]
-
-   innovation = measurement-mean_measure
-   residual = measurement-gyro_obs_pred(dsp.arm_mat_trans_f32(posterior_x)[1])
-   gyro_measurement_noise = update_gyro_measurement_noise(residual, raw_cov_measure)
-   process_noise = update_process_noise(innovation, kalman_gain, process_noise, gyro_noise_lerp)
-   posterior_cov = (posterior_cov + dsp.arm_mat_trans_f32(posterior_cov)[1])/2
-
-   return posterior_x, posterior_cov
+    x_prime = x+np.dot(K, z-zp)
+    P_prime = P+np.dot(np.dot(K,Pz), K.T)
+    return x_prime, P_prime
